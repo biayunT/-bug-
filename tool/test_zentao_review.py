@@ -2,6 +2,7 @@
 
 import base64
 import json
+import os
 from pathlib import Path
 import tempfile
 import unittest
@@ -22,9 +23,14 @@ class 反馈导入检查(unittest.IsolatedAsyncioTestCase):
             {"bug_id": i, "revision": record_revision(self.store[str(i)]), "status": status,
              "remark": "验证现象" if status in ("unresolved", "continue") else "", "images": [], "updated_at": "2026-11-04T12:00:00Z"}
             for i, status in zip(range(12, 16), ["resolved", "unresolved", "continue", "pending"])]}
-        self.source = self.root / "feedback.json"
+        self.feedback_dir = self.root / "feedbacks"
+        self.feedback_dir.mkdir()
+        self.source = self.feedback_dir / "feedback.json"
+        self.feedback_patch = patch.object(server, "DEFAULT_FEEDBACK_DIR", self.feedback_dir)
+        self.feedback_patch.start()
 
     async def asyncTearDown(self):
+        self.feedback_patch.stop()
         self.temporary.cleanup()
 
     def write_document(self):
@@ -98,6 +104,64 @@ class 反馈导入检查(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(previous, server.DEFAULT_VERIFY_FILE.read_bytes())
             request.assert_not_called()
             resolve.assert_not_called()
+
+    async def test_回归默认读取反馈目录JSON且跳过已解决移除项(self):
+        self.source = self.feedback_dir / "zentao-review.json"
+        self.write_document()
+        pending = dict(self.store)
+        pending.pop("12")
+        with patch.object(server, "DEFAULT_VERIFY_FILE", self.root / "pending.json"), patch.object(
+            server, "BUG_CACHE_FILE", self.root / "cache.json"
+        ), patch.object(server, "DEFAULT_REPORT_FILE", self.root / "report.html"), patch.object(
+            server.zentao_client, "site_root", self.document["site_root"]
+        ), patch.object(server.zentao_client, "request", new_callable=AsyncMock) as request:
+            server.save_pending_store(pending)
+            result = json.loads(await server.read_review_feedback())
+            self.assertEqual(Path(result["source"]), self.source.resolve())
+            self.assertEqual([item["bug_id"] for item in result["items"]], [13, 14, 15])
+            self.assertIn("回归bug", server.CODEX_INSTRUCTIONS)
+            request.assert_not_called()
+
+    async def test_默认选择反馈目录修改时间最新的JSON而非报告旁旧文件(self):
+        self.write_document()
+        os.utime(self.source, (100, 100))
+        latest = self.feedback_dir / "zentao-review (2).json"
+        latest.write_text(json.dumps(self.document), encoding="utf-8")
+        os.utime(latest, (200, 200))
+        reports = self.root / "reports"
+        reports.mkdir()
+        (reports / "zentao-review.json").write_text("旧反馈", encoding="utf-8")
+        with patch.object(server, "DEFAULT_VERIFY_FILE", self.root / "records" / "pending.json"), patch.object(
+            server, "BUG_CACHE_FILE", self.root / "records" / "cache.json"
+        ), patch.object(server, "DEFAULT_REPORT_FILE", reports / "report.html"), patch.object(
+            server.zentao_client, "site_root", self.document["site_root"]
+        ), patch.object(server.zentao_client, "request", new_callable=AsyncMock) as request:
+            server.save_pending_store(self.store)
+            result = json.loads(await server.read_review_feedback())
+            self.assertEqual(Path(result["source"]), latest.resolve())
+            request.assert_not_called()
+
+    async def test_最新JSON损坏时提示错误而不退回旧验收结论(self):
+        self.write_document()
+        os.utime(self.source, (100, 100))
+        latest = self.feedback_dir / "最新反馈.json"
+        latest.write_text("{", encoding="utf-8")
+        os.utime(latest, (200, 200))
+        with patch.object(server.zentao_client, "request", new_callable=AsyncMock) as request:
+            result = await server.read_review_feedback()
+            self.assertIn("反馈未导入", result)
+            request.assert_not_called()
+
+    async def test_默认JSON缺失提示绑定路径且不使用旧档案代替本次反馈(self):
+        with patch.object(server, "DEFAULT_VERIFY_FILE", self.root / "pending.json"), patch.object(
+            server, "DEFAULT_REPORT_FILE", self.root / "report.html"
+        ), patch.object(server.zentao_client, "request", new_callable=AsyncMock) as request:
+            server.review_archive_path().write_text(json.dumps(self.document), encoding="utf-8")
+            result = await server.read_review_feedback()
+            self.assertIn(str(self.feedback_dir / "zentao-review.json"), result)
+            self.assertIn("绑定 / 保存反馈 JSON", result)
+            self.assertIn("尚未找到", result)
+            request.assert_not_called()
 
     def test_重新导入保留旧备注历史并可重复读取(self):
         self.write_document()

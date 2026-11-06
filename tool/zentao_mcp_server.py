@@ -18,7 +18,7 @@ ZenTao (禅道开源版 22.6) Bug Management MCP Server — 专为 OpenAI Codex 
   ZENTAO_ACCOUNT     : 禅道登录账号
   ZENTAO_PASSWORD    : 禅道登录密码
   ZENTAO_VERIFY_FILE : (可选) 本地待验证列表 JSON 存储路径，默认保存在 ~/.zentao_pending_verify.json
-  ZENTAO_REPORT_FILE : (可选) HTML 报告路径，默认 C:/tool/reports/zentao-pending.html（脚本旁 reports 目录）
+  ZENTAO_REPORT_FILE : (可选) HTML 报告路径，默认 C:/-bug-/tool/reports/zentao-pending.html（脚本旁 reports 目录）
 """
 
 from datetime import datetime
@@ -44,7 +44,9 @@ CODEX_INSTRUCTIONS = (
     "登记时单独填写 solution（实际修改方案）、test_results（实际检查结果）和 notes（待核实项）；"
     "完成一批后调用 export_pending_report 生成含原始截图的离线 HTML 报告并提供本地路径。"
     "阶段2(人工验证后解决)：仅当用户在新对话消息中明确表示“已验证通过、可以解决”时，才允许调用 resolve_verified_bug 回写禅道。"
-    "用户在后续对话要求按HTML验收反馈处理时，先调用 read_review_feedback 读取其保存的反馈文件。"
+    "用户在后续对话说‘回归bug’、‘回归一下bug’或要求按HTML验收反馈处理时，"
+    "第一步必须调用 read_review_feedback()，默认读取 C:/-bug- 目录下修改时间最新的 JSON，"
+    "不要先索要Bug ID、JSON路径或读取浏览器暂存；仅在文件缺失或校验失败时说明具体问题。"
     "报告的已解决标记表示用户验证通过并授权解决；只对用户本次要求处理的已解决条目调用 resolve_verified_bug。"
     "未解决按备注重新复现和回归；继续处理参考说明与图片修改；待验证跳过。"
     "读取反馈本身绝不回写禅道；不得将模型自检结果当作用户已解决标记。"
@@ -65,6 +67,7 @@ DEFAULT_VERIFY_FILE = Path(
 DEFAULT_REPORT_FILE = Path(os.environ.get(
     "ZENTAO_REPORT_FILE", str(Path(__file__).parent / "reports" / "zentao-pending.html")
 )).expanduser()
+DEFAULT_FEEDBACK_DIR = Path(__file__).resolve().parent.parent
 BUG_CACHE_FILE = DEFAULT_VERIFY_FILE.with_name(f"{DEFAULT_VERIFY_FILE.stem}_bugs.json")
 
 
@@ -681,19 +684,30 @@ def review_archive_path() -> Path:
     return DEFAULT_VERIFY_FILE.with_name(f"{DEFAULT_VERIFY_FILE.stem}_review.json")
 
 
+def latest_feedback_file() -> Path:
+    """从用户约定的反馈目录选取最新 JSON，仍由导入流程校验格式和验收轮次。"""
+    candidates = (path for path in DEFAULT_FEEDBACK_DIR.glob("*.json") if path.is_file())
+    # 只选择最新文件；若它损坏或轮次过期，不能退回旧反馈代替本轮人工验收。
+    return max(candidates, key=lambda path: (path.stat().st_mtime_ns, path.name),
+               default=DEFAULT_FEEDBACK_DIR / "zentao-review.json")
+
+
 @mcp.tool()
 async def read_review_feedback(feedback_path: str = "") -> str:
     """读取用户从 HTML 保存的标记、说明和图片，返回逐条处理清单；不请求禅道、不修改源码。
 
-    只在用户要求按反馈处理时读取。已解决表示用户已验证通过并授权解决，代理仍须在后续对话
-    收到处理指令后逐条调用 resolve_verified_bug；本工具不会代为解决。待验证不得继续修改。
+    用户说“回归 Bug”“回归一下 bug”或“按反馈处理”时，第一步直接调用本工具，
+    不必再索要 Bug ID 或默认文件路径。已解决表示用户已验证通过并授权解决，
+    代理收到本次处理指令后逐条调用 resolve_verified_bug；本工具不会代为解决。待验证不得继续修改。
 
     Args:
-        feedback_path: 用户保存的 .json 反馈路径，默认报告目录的 zentao-review.json
+        feedback_path: 用户保存的 .json 反馈路径，留空读取 C:/-bug- 下修改时间最新的 JSON
     """
-    source = Path(feedback_path).expanduser() if feedback_path else DEFAULT_REPORT_FILE.parent / "zentao-review.json"
+    source = Path(feedback_path).expanduser() if feedback_path else latest_feedback_file()
     if not source.is_file():
-        return f"尚未找到反馈文件：{source}。请在 HTML 点击“保存反馈文件”，并提供实际保存路径。"
+        return (f"尚未找到反馈文件：{source}。请在 HTML 点击“绑定 / 保存反馈 JSON”，"
+                "选择此路径并等待‘JSON 已保存’；若使用下载模式，请将下载文件放到此路径。"
+                "仅在你保存到其他位置时才需要提供路径。未回写禅道或修改源码。")
     try:
         result = import_review(source, load_pending_store(), zentao_client.site_root,
                                review_archive_path(), DEFAULT_REPORT_FILE.parent / "review-images")

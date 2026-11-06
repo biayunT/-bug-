@@ -3,6 +3,8 @@ const reviewSeed = JSON.parse(document.getElementById('review-data').textContent
 const reviewLabels = {pending: '待验证', resolved: '已解决', unresolved: '未解决', continue: '继续处理'};
 const reviews = new Map();
 let reviewDB, feedbackHandle, imageJobs = 0, changeVersion = 0, draftWrites = Promise.resolve();
+let autoSaveTimer, saving = false, autoSaveEnabled = false;
+const handleKey = reviewSeed.site_root + '#' + location.pathname;
 const feedbackMessage = document.getElementById('feedback-message');
 function message(text, error = false) {
   feedbackMessage.textContent = text;
@@ -10,17 +12,30 @@ function message(text, error = false) {
 }
 function openDrafts() {
   return new Promise((resolve, reject) => {
-    const request = indexedDB.open('zentao-review-drafts', 1);
-    request.onupgradeneeded = () => request.result.createObjectStore('reviews');
-    request.onsuccess = () => resolve(request.result);
+    const request = indexedDB.open('zentao-review-drafts', 2);
+    let blocked = false;
+    request.onupgradeneeded = () => {
+      // 升级时保留已有人工标记，只新增文件授权句柄的存储区。
+      for (const name of ['reviews', 'files']) {
+        if (!request.result.objectStoreNames.contains(name)) request.result.createObjectStore(name);
+      }
+    };
+    request.onblocked = () => {
+      blocked = true;
+      message('正在等待浏览器读取暂存，请关闭其他旧版报告标签页；关闭后会继续，避免遗漏标记。', true);
+    };
+    request.onsuccess = () => {
+      if (blocked) message('浏览器暂存已恢复，请绑定 / 保存反馈 JSON。');
+      resolve(request.result);
+    };
     request.onerror = () => reject(request.error);
   });
 }
-function draftRequest(mode, key, value) {
+function draftRequest(mode, key, value, store = 'reviews') {
   return new Promise((resolve, reject) => {
-    const transaction = reviewDB.transaction('reviews', mode);
-    const request = mode === 'readonly' ? transaction.objectStore('reviews').get(key)
-      : transaction.objectStore('reviews').put(value, key);
+    const transaction = reviewDB.transaction(store, mode);
+    const request = mode === 'readonly' ? transaction.objectStore(store).get(key)
+      : transaction.objectStore(store).put(value, key);
     transaction.oncomplete = () => resolve(request.result);
     transaction.onabort = () => reject(transaction.error);
     transaction.onerror = () => reject(transaction.error);
@@ -76,13 +91,14 @@ function changed(card) {
   const item = reviews.get(card.id.slice(4));
   item.updated_at = new Date().toISOString(); item.previous_round = false;
   updateReview(card);
-  document.getElementById('save-feedback').textContent = '保存反馈文件 ●';
-  message('有新标记尚未保存为反馈文件。');
+  document.getElementById('save-feedback').textContent = '保存反馈 JSON ●';
+  message(autoSaveEnabled ? '正在等待自动保存…' : '尚未保存为 JSON，请点击“绑定 / 保存反馈 JSON”。');
+  scheduleAutoSave();
   if (reviewDB) {
     // 串行提交快照，快速输入时较早的写入不能覆盖较晚的备注和附件。
     const snapshot = structuredClone(item);
     draftWrites = draftWrites.then(() => draftRequest('readwrite', draftKey(item.bug_id), snapshot))
-      .catch(() => message('浏览器暂存失败，请点击“保存反馈文件”，避免丢失。', true));
+      .catch(() => message('浏览器暂存失败，请点击“保存反馈 JSON”，避免丢失。', true));
   }
 }
 function readImage(file) {
@@ -108,23 +124,34 @@ function reviewDocument() {
   return {format: 'zentao-review', version: 1, site_root: reviewSeed.site_root,
     exported_at: new Date().toISOString(), items: [...reviews.values()].map(({previous_round, ...item}) => structuredClone(item))};
 }
-async function saveFeedback() {
+function scheduleAutoSave(immediate = false) {
+  clearTimeout(autoSaveTimer);
+  if (!feedbackHandle || !autoSaveEnabled) return;
+  // 标记切换和输入失焦立即落盘；连续输入仍防抖，写入过程沿用 saveFeedback 的串行保护。
+  if (immediate) void saveFeedback(false);
+  else autoSaveTimer = setTimeout(() => saveFeedback(false), 600);
+}
+async function saveFeedback(manual = true, chooseFile = false) {
+  clearTimeout(autoSaveTimer);
+  if (saving) return;
   if (imageJobs) {message('图片正在读取，请完成后再保存。', true); return;}
   for (const card of cards) {
     const item = reviews.get(card.id.slice(4));
     if (['unresolved', 'continue'].includes(item.status) && !item.remark.trim() && !item.images.length) {
-      card.hidden = false; card.scrollIntoView({block: 'center'}); card.querySelector('textarea').focus();
+      if (manual) {card.hidden = false; card.scrollIntoView({block: 'center'}); card.querySelector('textarea').focus();}
       message('Bug #' + item.bug_id + ' 请填写说明或添加图片后再保存。', true); return;
     }
   }
   const text = JSON.stringify(reviewDocument(), null, 2);
   const savingVersion = changeVersion;
   if (new Blob([text]).size > 75 * 1024 * 1024) {message('反馈超过 75 MB，请减少图片后重新保存。', true); return;}
-  const button = document.getElementById('save-feedback'); button.disabled = true;
+  const button = document.getElementById('save-feedback'), changeFile = document.getElementById('change-feedback-file');
+  saving = true; button.disabled = true; changeFile.disabled = true;
+  message('正在保存反馈 JSON…');
   try {
-    if ('showSaveFilePicker' in window) {
+    if (manual && (chooseFile || !feedbackHandle) && 'showSaveFilePicker' in window) {
       try {
-        feedbackHandle ||= await window.showSaveFilePicker({suggestedName: 'zentao-review.json',
+        feedbackHandle = await window.showSaveFilePicker({suggestedName: 'zentao-review.json',
           types: [{description: 'Bug 验收反馈', accept: {'application/json': ['.json']}}]});
       } catch (error) {
         if (error.name === 'AbortError') {message('已取消保存，标记仍保留在本浏览器。'); return;}
@@ -132,24 +159,48 @@ async function saveFeedback() {
       }
     }
     if (feedbackHandle) {
-      const writer = await feedbackHandle.createWritable(); await writer.write(text); await writer.close();
-      message('反馈文件已保存。告诉我“按反馈处理”，并提供保存位置即可。');
+      // 刷新后浏览器可能收回写权限；仅允许用户点击时请求恢复，后台保存不能弹授权框。
+      if (feedbackHandle.queryPermission && await feedbackHandle.queryPermission({mode: 'readwrite'}) !== 'granted') {
+        if (!manual || await feedbackHandle.requestPermission({mode: 'readwrite'}) !== 'granted') {
+          autoSaveEnabled = false;
+          message('JSON 写入授权已失效，请点击“保存反馈 JSON”恢复；新标记尚未写入文件。', true); return;
+        }
+      }
+      const writer = await feedbackHandle.createWritable();
+      try {await writer.write(text); await writer.close();}
+      catch (error) {
+        // 写失败后释放文件锁，确保手动重试能够重新创建写入流。
+        try {await writer.abort();} catch {}
+        throw error;
+      }
+      autoSaveEnabled = true;
+      let remembered = !!reviewDB;
+      if (reviewDB) {
+        try {await draftRequest('readwrite', handleKey, feedbackHandle, 'files');}
+        catch {remembered = false;}
+      }
+      message('JSON 已保存 · ' + feedbackHandle.name + '。后续修改将自动保存，完成后告诉我“回归 Bug”。'
+        + (remembered ? '' : ' 浏览器无法记住文件，刷新后需重新绑定。'));
     } else {
+      if (!manual) return;
       const url = URL.createObjectURL(new Blob([text], {type: 'application/json'}));
       const link = document.createElement('a'); link.href = url; link.download = 'zentao-review.json'; link.click();
       setTimeout(() => URL.revokeObjectURL(url), 10000);
-      message('已发起下载 zentao-review.json。请保存到 C:\\tool\\reports，再告诉我“按反馈处理”。');
+      message('已发起下载 zentao-review.json。请保存到 C:\\-bug-，再告诉我“回归 Bug”；此模式每次修改后需重新下载覆盖。');
     }
-    if (savingVersion === changeVersion) button.textContent = '保存反馈文件';
-    else message('保存期间又有新修改，请再次保存反馈文件。');
+    if (savingVersion === changeVersion) button.textContent = feedbackHandle ? '保存反馈 JSON' : '绑定 / 保存反馈 JSON';
+    else {
+      message(autoSaveEnabled ? '保存期间又有新修改，正在继续自动保存…' : '保存期间又有新修改，请再次保存反馈 JSON。');
+      scheduleAutoSave();
+    }
   } catch (error) {
-    feedbackHandle = undefined;
+    autoSaveEnabled = false;
     message('保存失败，标记仍在本页：' + error.message + '。请重试。', true);
-  } finally {button.disabled = false;}
+  } finally {saving = false; button.disabled = false; changeFile.disabled = false;}
 }
 async function initializeReviews() {
   try {reviewDB = await openDrafts();}
-  catch {message('浏览器无法暂存，请在关闭前保存反馈文件。', true);}
+  catch (error) {message('浏览器无法暂存：' + error.message + ' 请在关闭前保存反馈 JSON。', true);}
   for (const card of cards) {
     const id = card.id.slice(4);
     let input = reviewSeed.items.find(item => String(item.bug_id) === id);
@@ -168,8 +219,9 @@ async function initializeReviews() {
     textarea.setAttribute('aria-label', 'Bug #' + id + ' 反馈说明');
     upload.setAttribute('aria-label', 'Bug #' + id + ' 添加反馈图片');
     select.value = item.status; textarea.value = item.remark;
-    select.addEventListener('change', () => {item.status = select.value; changed(card);});
+    select.addEventListener('change', () => {item.status = select.value; changed(card); scheduleAutoSave(true);});
     textarea.addEventListener('input', () => {item.remark = textarea.value; changed(card);});
+    textarea.addEventListener('blur', () => scheduleAutoSave(true));
     upload.addEventListener('change', async () => {
       const files = [...upload.files], errorBox = section.querySelector('.review-error');
       errorBox.textContent = '正在读取反馈图片…'; upload.disabled = true; imageJobs++;
@@ -177,12 +229,25 @@ async function initializeReviews() {
         if (files.length + item.images.length > 10) throw new Error('每条 Bug 最多添加 10 张反馈图片。');
         const images = await Promise.all(files.map(readImage)); item.images.push(...images); errorBox.textContent = ''; changed(card);
       } catch (error) {errorBox.textContent = error.message;}
-      finally {upload.value = ''; upload.disabled = false; imageJobs--;}
+      finally {upload.value = ''; upload.disabled = false; imageJobs--; scheduleAutoSave();}
     });
     updateReview(card);
   }
   document.getElementById('save-feedback').disabled = false;
-  document.getElementById('save-feedback').textContent = '保存反馈文件';
+  document.getElementById('change-feedback-file').disabled = false;
+  if (reviewDB) {
+    try {
+      feedbackHandle = await draftRequest('readonly', handleKey, undefined, 'files');
+      if (feedbackHandle) {
+        autoSaveEnabled = await feedbackHandle.queryPermission({mode: 'readwrite'}) === 'granted';
+        message(autoSaveEnabled ? '已恢复 JSON 文件绑定，正在同步本页反馈…'
+          : '已找到绑定的 JSON，请点击“保存反馈 JSON”恢复写入授权。');
+        if (autoSaveEnabled) scheduleAutoSave();
+      }
+    } catch {message('无法恢复文件绑定，请重新选择反馈 JSON。', true);}
+  }
+  document.getElementById('save-feedback').textContent = feedbackHandle ? '保存反馈 JSON' : '绑定 / 保存反馈 JSON';
 }
-document.getElementById('save-feedback').addEventListener('click', saveFeedback);
+document.getElementById('save-feedback').addEventListener('click', () => saveFeedback());
+document.getElementById('change-feedback-file').addEventListener('click', () => saveFeedback(true, true));
 const reviewsReady = initializeReviews();
